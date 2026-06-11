@@ -47,7 +47,7 @@ use libc::{c_int, c_uint, c_void, ssize_t, c_short, timespec, pollfd};
 use crate::alsa;
 use core::convert::Infallible;
 use core::marker::PhantomData;
-use core::mem::{size_of, zeroed};
+use core::mem::size_of;
 use core::ffi::CStr;
 use core::str::FromStr;
 use ::alloc::ffi::CString;
@@ -1262,6 +1262,30 @@ const STATUS_SIZE: usize = 152;
 #[derive(Debug)]
 pub struct Status([u64; (STATUS_SIZE+7)/8]);
 
+// 16-byte, 8-aligned scratch for the snd_pcm_status_get_*htstamp() calls.
+//
+// The Debian/Ubuntu "time64" transition rebuilt 32-bit libasound2 (as
+// libasound2t64) with 64-bit time_t, so its `struct timespec` is 16 bytes even
+// on armhf, where Rust's libc::timespec is still 8 bytes. Passing the C call an
+// 8-byte slot lets it write 16 bytes and smash the stack (a real, reported
+// SIGSEGV crash-loop). Always hand it a 16-byte buffer so it cannot overflow,
+// regardless of which timespec ABI the running libasound was built for.
+#[repr(C, align(8))]
+struct Htstamp64([u8; 16]);
+const _: () = assert!(core::mem::size_of::<Htstamp64>() >= 16);
+const _: () = assert!(core::mem::align_of::<Htstamp64>() >= core::mem::align_of::<timespec>());
+
+// Copy the seconds/nanoseconds out of the filled buffer, assuming the 64-bit
+// time_t little-endian layout (tv_sec i64 @0, tv_nsec i32 @8) that armhf t64 and
+// all 64-bit targets use. On a legacy time32 system the decode is lossy, but
+// callers that drop the timestamp (e.g. cpal consumers that ignore the callback
+// info) never observe it; what matters is that the C call did not overflow.
+fn decode_htstamp(buf: &Htstamp64) -> timespec {
+    let tv_sec = i64::from_ne_bytes(buf.0[0..8].try_into().unwrap());
+    let tv_nsec = i32::from_ne_bytes(buf.0[8..12].try_into().unwrap());
+    timespec { tv_sec: tv_sec as _, tv_nsec: tv_nsec as _ }
+}
+
 impl Status {
     fn new() -> Status {
         assert!(unsafe { alsa::snd_pcm_status_sizeof() } as usize <= STATUS_SIZE);
@@ -1271,21 +1295,21 @@ impl Status {
     fn ptr(&self) -> *mut alsa::snd_pcm_status_t { self.0.as_ptr() as *const _ as *mut alsa::snd_pcm_status_t }
 
     pub fn get_htstamp(&self) -> timespec {
-        let mut h: timespec = unsafe { zeroed() };
-        unsafe { alsa::snd_pcm_status_get_htstamp(self.ptr(), &mut h) };
-        h
+        let mut buf = Htstamp64([0u8; 16]);
+        unsafe { alsa::snd_pcm_status_get_htstamp(self.ptr(), buf.0.as_mut_ptr() as *mut _) };
+        decode_htstamp(&buf)
     }
 
     pub fn get_trigger_htstamp(&self) -> timespec {
-        let mut h: timespec = unsafe { zeroed() };
-        unsafe { alsa::snd_pcm_status_get_trigger_htstamp(self.ptr(), &mut h) };
-        h
+        let mut buf = Htstamp64([0u8; 16]);
+        unsafe { alsa::snd_pcm_status_get_trigger_htstamp(self.ptr(), buf.0.as_mut_ptr() as *mut _) };
+        decode_htstamp(&buf)
     }
 
     pub fn get_audio_htstamp(&self) -> timespec {
-        let mut h: timespec = unsafe { zeroed() };
-        unsafe { alsa::snd_pcm_status_get_audio_htstamp(self.ptr(), &mut h) };
-        h
+        let mut buf = Htstamp64([0u8; 16]);
+        unsafe { alsa::snd_pcm_status_get_audio_htstamp(self.ptr(), buf.0.as_mut_ptr() as *mut _) };
+        decode_htstamp(&buf)
     }
 
     pub fn get_state(&self) -> State { State::from_c_int(
@@ -1453,4 +1477,24 @@ fn format_display_from_str() {
     for format in ALL_FORMATS {
         assert_eq!(format, format.to_string().parse().unwrap());
     }
+}
+
+// The htstamp scratch buffer must be able to hold a 64-bit-time_t struct
+// timespec (16 bytes) so libasound2t64 cannot overflow it on 32-bit targets.
+#[test]
+fn htstamp_buffer_holds_t64_timespec() {
+    assert!(size_of::<Htstamp64>() >= 16);
+    assert!(size_of::<Htstamp64>() >= size_of::<timespec>());
+}
+
+// decode_htstamp reads tv_sec (i64 @0) and tv_nsec (i32 @8) from the filled
+// buffer in the 64-bit-time_t little-endian layout.
+#[test]
+fn htstamp_decode_reads_t64_layout() {
+    let mut raw = [0u8; 16];
+    raw[0..8].copy_from_slice(&1_700_000_123i64.to_ne_bytes());
+    raw[8..12].copy_from_slice(&456_789_000i32.to_ne_bytes());
+    let ts = decode_htstamp(&Htstamp64(raw));
+    assert_eq!(ts.tv_sec as i64, 1_700_000_123);
+    assert_eq!(ts.tv_nsec as i32, 456_789_000);
 }
