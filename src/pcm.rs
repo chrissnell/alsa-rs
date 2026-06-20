@@ -1275,15 +1275,56 @@ struct Htstamp64([u8; 16]);
 const _: () = assert!(core::mem::size_of::<Htstamp64>() >= 16);
 const _: () = assert!(core::mem::align_of::<Htstamp64>() >= core::mem::align_of::<timespec>());
 
-// Copy the seconds/nanoseconds out of the filled buffer, assuming the 64-bit
-// time_t little-endian layout (tv_sec i64 @0, tv_nsec i32 @8) that armhf t64 and
-// all 64-bit targets use. On a legacy time32 system the decode is lossy, but
-// callers that drop the timestamp (e.g. cpal consumers that ignore the callback
-// info) never observe it; what matters is that the C call did not overflow.
+// Decode the seconds/nanoseconds out of the filled buffer. The buffer is always
+// zeroed before the C call, which lets us recover the value correctly under
+// every timespec ABI rather than assuming a single layout.
+//
+// On 64-bit targets `struct timespec` is natively 16 bytes (tv_sec i64 @0,
+// tv_nsec i64 @8) and matches libasound, so decode it directly.
+//
+// On 32-bit targets the running libasound may use either ABI:
+//   - legacy time32: 8-byte write, tv_sec i32 @0, tv_nsec i32 @4
+//   - time64 / t64:  16-byte write, tv_sec i64 @0, tv_nsec i32 @8
+// tv_sec is at offset 0 either way (the high 4 bytes of a t64 i64 are zero for
+// any realistic clock value, and a time32 build's libc::timespec.tv_sec is i32
+// anyway). tv_nsec is the only field that moves. Because the buffer was zeroed,
+// the unwritten tail stays zero, so the t64 nsec slot at offset 8 is non-zero
+// only under a 16-byte write -- when it is zero we read the time32 slot at
+// offset 4. This never yields a wrong non-zero nsec on either ABI.
+//
+// Decoding correctly on time32 (not just avoiding the overflow) matters: cpal's
+// ALSA backend derives and validates `htstamp - trigger_htstamp` internally, so
+// a garbage decode there triggers spurious "get_htstamp was earlier than
+// get_trigger_htstamp" errors and stream rebuilds even for callers that ignore
+// the timestamp (see graywolf issue #336).
 fn decode_htstamp(buf: &Htstamp64) -> timespec {
-    let tv_sec = i64::from_ne_bytes(buf.0[0..8].try_into().unwrap());
-    let tv_nsec = i32::from_ne_bytes(buf.0[8..12].try_into().unwrap());
-    timespec { tv_sec: tv_sec as _, tv_nsec: tv_nsec as _ }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let (tv_sec, tv_nsec) = decode_htstamp_time64(&buf.0);
+        timespec { tv_sec: tv_sec as _, tv_nsec: tv_nsec as _ }
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let (tv_sec, tv_nsec) = decode_htstamp_time32_aware(&buf.0);
+        timespec { tv_sec: tv_sec as _, tv_nsec: tv_nsec as _ }
+    }
+}
+
+// Pure decoders, host-independent so both ABIs can be unit-tested anywhere.
+#[allow(dead_code)]
+fn decode_htstamp_time64(b: &[u8; 16]) -> (i64, i64) {
+    let tv_sec = i64::from_ne_bytes(b[0..8].try_into().unwrap());
+    let tv_nsec = i64::from_ne_bytes(b[8..16].try_into().unwrap());
+    (tv_sec, tv_nsec)
+}
+
+#[allow(dead_code)]
+fn decode_htstamp_time32_aware(b: &[u8; 16]) -> (i32, i32) {
+    let tv_sec = i32::from_ne_bytes(b[0..4].try_into().unwrap());
+    let nsec_t64 = i32::from_ne_bytes(b[8..12].try_into().unwrap());
+    let nsec_t32 = i32::from_ne_bytes(b[4..8].try_into().unwrap());
+    let tv_nsec = if nsec_t64 != 0 { nsec_t64 } else { nsec_t32 };
+    (tv_sec, tv_nsec)
 }
 
 impl Status {
@@ -1487,8 +1528,9 @@ fn htstamp_buffer_holds_t64_timespec() {
     assert!(size_of::<Htstamp64>() >= size_of::<timespec>());
 }
 
-// decode_htstamp reads tv_sec (i64 @0) and tv_nsec (i32 @8) from the filled
-// buffer in the 64-bit-time_t little-endian layout.
+// 64-bit / t64 layout: libasound wrote a 16-byte timespec (tv_sec i64 @0,
+// tv_nsec @8). Both the native 64-bit decoder and the in-use decode_htstamp on
+// a 64-bit host must recover it exactly.
 #[test]
 fn htstamp_decode_reads_t64_layout() {
     let mut raw = [0u8; 16];
@@ -1497,4 +1539,48 @@ fn htstamp_decode_reads_t64_layout() {
     let ts = decode_htstamp(&Htstamp64(raw));
     assert_eq!(ts.tv_sec as i64, 1_700_000_123);
     assert_eq!(ts.tv_nsec as i32, 456_789_000);
+
+    let (s, n) = decode_htstamp_time64(&raw);
+    assert_eq!(s, 1_700_000_123);
+    assert_eq!(n, 456_789_000);
+}
+
+// Regression for graywolf #336: on a pre-t64 (time32) libasound the C call
+// writes only 8 bytes (tv_sec i32 @0, tv_nsec i32 @4); bytes 8..16 stay zero
+// because we zero the buffer first. The time32-aware decoder must read tv_nsec
+// from offset 4, not the (zero) t64 slot at offset 8. The old fixed-t64 decode
+// mixed nsec into tv_sec and produced garbage, flooding cpal with
+// "get_htstamp was earlier than get_trigger_htstamp" errors.
+#[test]
+fn htstamp_decode_reads_time32_layout() {
+    let mut raw = [0u8; 16];
+    raw[0..4].copy_from_slice(&54_321i32.to_ne_bytes());      // tv_sec @0
+    raw[4..8].copy_from_slice(&123_456_789i32.to_ne_bytes()); // tv_nsec @4
+    // bytes 8..16 remain zero (libasound never wrote there).
+    let (s, n) = decode_htstamp_time32_aware(&raw);
+    assert_eq!(s, 54_321);
+    assert_eq!(n, 123_456_789);
+}
+
+// The time32-aware decoder also recovers a t64 (16-byte) write, so a single
+// 32-bit binary is correct on both pre-t64 and t64 userlands.
+#[test]
+fn htstamp_decode_time32_aware_handles_t64_write() {
+    let mut raw = [0u8; 16];
+    raw[0..8].copy_from_slice(&54_321i64.to_ne_bytes());      // tv_sec i64 @0
+    raw[8..12].copy_from_slice(&123_456_789i32.to_ne_bytes()); // tv_nsec @8
+    let (s, n) = decode_htstamp_time32_aware(&raw);
+    assert_eq!(s, 54_321);
+    assert_eq!(n, 123_456_789);
+}
+
+// A zero nanosecond field decodes to zero under both ABIs (the disambiguation
+// never invents a non-zero nsec).
+#[test]
+fn htstamp_decode_zero_nsec() {
+    let mut raw = [0u8; 16];
+    raw[0..4].copy_from_slice(&7i32.to_ne_bytes());
+    let (s, n) = decode_htstamp_time32_aware(&raw);
+    assert_eq!(s, 7);
+    assert_eq!(n, 0);
 }
